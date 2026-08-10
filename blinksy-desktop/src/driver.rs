@@ -70,6 +70,7 @@ use blinksy::{
 };
 use button_driver::InstantProvider;
 use core::{fmt, marker::PhantomData};
+use debug_ignore::DebugIgnore;
 use egui::ahash::{HashMap, HashMapExt as _};
 use egui_miniquad as egui_mq;
 use glam::{vec3, Mat4, Vec3, Vec4, Vec4Swizzles};
@@ -78,6 +79,10 @@ use miniquad::*;
 use std::sync::mpsc::{channel, Receiver, SendError, Sender};
 
 use crate::button::{ButtonState, DesktopButton};
+
+/// Type alias for a hook function that can be used to inject custom GUI rendering into the simulator window.
+pub type BoxedHookFn =
+    Box<DebugIgnore<dyn FnMut(&mut dyn RenderingBackend, &egui::Context) + Send + Sync>>;
 
 /// Configuration options for the desktop simulator.
 ///
@@ -133,6 +138,7 @@ pub struct Desktop<Dim, Layout> {
     driver: DesktopDriver<Dim, Layout>,
     stage: DesktopStageOptions,
     buttons: HashMap<KeyCode, ButtonState>,
+    hook: Option<BoxedHookFn>,
 }
 
 impl Desktop<Dim1d, ()> {
@@ -199,6 +205,7 @@ impl Desktop<Dim1d, ()> {
             driver,
             stage,
             buttons: HashMap::new(),
+            hook: None,
         }
     }
 }
@@ -268,6 +275,7 @@ impl Desktop<Dim2d, ()> {
             driver,
             stage,
             buttons: HashMap::new(),
+            hook: None,
         }
     }
 }
@@ -337,6 +345,7 @@ impl Desktop<Dim3d, ()> {
             driver,
             stage,
             buttons: HashMap::new(),
+            hook: None,
         }
     }
 }
@@ -354,11 +363,12 @@ where
             driver,
             stage,
             buttons,
+            hook,
         } = self;
 
         std::thread::spawn(move || f(driver));
 
-        DesktopStage::start(move || DesktopStage::new(stage, buttons));
+        DesktopStage::start(move || DesktopStage::new(stage, buttons, hook));
     }
 
     #[cfg(feature = "async")]
@@ -372,9 +382,12 @@ where
             driver,
             stage,
             buttons,
+            hook,
         } = self;
 
-        std::thread::spawn(move || DesktopStage::start(move || DesktopStage::new(stage, buttons)));
+        std::thread::spawn(move || {
+            DesktopStage::start(move || DesktopStage::new(stage, buttons, hook))
+        });
         f(driver).await
     }
 
@@ -387,6 +400,15 @@ where
     {
         let state = button.clone_state();
         self.buttons.insert(keycode, state);
+        self
+    }
+
+    /// Registers a custom UI hook function that will be called during the rendering loop.
+    pub fn with_hook<F>(mut self, hook: F) -> Self
+    where
+        F: 'static + FnMut(&mut dyn RenderingBackend, &egui::Context) + Send + Sync + Clone,
+    {
+        self.hook = Some(Box::new(DebugIgnore(hook)));
         self
     }
 }
@@ -761,13 +783,15 @@ impl LedPicker {
 struct UiManager {
     egui_mq: egui_mq::EguiMq,
     want_mouse_capture: bool,
+    gui_hook: Option<BoxedHookFn>,
 }
 
 impl UiManager {
-    fn new(ctx: &mut dyn RenderingBackend) -> Self {
+    fn new(ctx: &mut dyn RenderingBackend, hook: Option<BoxedHookFn>) -> Self {
         Self {
             egui_mq: egui_mq::EguiMq::new(ctx),
             want_mouse_capture: false,
+            gui_hook: hook,
         }
     }
 
@@ -817,7 +841,7 @@ impl UiManager {
         brightness: f32,
         correction: ColorCorrection,
     ) {
-        self.egui_mq.run(ctx, |_mq_ctx, egui_ctx| {
+        self.egui_mq.run(ctx, |mq_ctx, egui_ctx| {
             self.want_mouse_capture = egui_ctx.wants_pointer_input();
 
             // Only show LED info window if an LED is selected
@@ -904,6 +928,10 @@ impl UiManager {
                             led_picker.selected_led = None;
                         }
                     });
+            }
+
+            if let Some(hook) = self.gui_hook.as_mut() {
+                hook(mq_ctx, egui_ctx);
             }
         });
     }
@@ -1099,7 +1127,11 @@ impl DesktopStage {
     }
 
     /// Create a new DesktopStage with the given LED positions, colors, and configuration.
-    fn new(options: DesktopStageOptions, buttons: HashMap<KeyCode, ButtonState>) -> Self {
+    fn new(
+        options: DesktopStageOptions,
+        buttons: HashMap<KeyCode, ButtonState>,
+        hook: Option<BoxedHookFn>,
+    ) -> Self {
         let DesktopStageOptions {
             positions,
             receiver,
@@ -1110,7 +1142,7 @@ impl DesktopStage {
         let mut ctx: Box<dyn RenderingBackend> = window::new_rendering_backend();
 
         // Initialize UI manager
-        let ui_manager = UiManager::new(&mut *ctx);
+        let ui_manager = UiManager::new(&mut *ctx, hook);
 
         // Initialize LED picker
         let led_picker = LedPicker::new(positions.clone(), config.led_radius);

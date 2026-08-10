@@ -7,6 +7,7 @@ use blinksy_desktop::{
     driver::{Desktop, DesktopError},
     time::elapsed_in_ms,
 };
+use std::sync::{atomic::AtomicUsize, Arc};
 use std::{thread::sleep, time::Duration};
 
 layout1d!(StripLayout, 30);
@@ -53,8 +54,23 @@ fn main() {
         Duration::from_millis(1),
         Duration::from_millis(1),
     );
+    let click_count = Arc::new(AtomicUsize::new(0));
+    let click2 = click_count.clone();
+
     Desktop::new_1d::<StripLayout>()
         .with_button(KeyCode::Space, &button)
+        .with_hook(move |_mq_ctx, egui_ctx| {
+            // This is where you could add custom GUI elements to the window if you wanted to.
+            egui::Window::new("Hello, GUI hook world!")
+                .collapsible(false)
+                .resizable(false)
+                .show(egui_ctx, |ui| {
+                    ui.label(format!(
+                        "The button has been clicked {} times.",
+                        click2.load(std::sync::atomic::Ordering::SeqCst)
+                    ));
+                });
+        })
         .start(move |driver| {
             let mut control = ControlBuilder::new_1d()
                 .with_layout::<StripLayout, { StripLayout::PIXEL_COUNT }>()
@@ -76,6 +92,7 @@ fn main() {
                     println!("Button activated! Changing color...");
                     let new_color = Okhsv::new(rand::random(), 1.0, 1.0);
                     control.set_pattern_params(FlatParams { color: new_color });
+                    click_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 button.reset();
 
